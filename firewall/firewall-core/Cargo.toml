@@ -1,0 +1,31 @@
+[package]
+name = "firewall-core"
+version = "0.1.0"
+edition = "2024"
+
+license.workspace = true
+
+[dependencies]
+firewall-common = { path = "../firewall-common", features = ["user"] }
+anyhow = { workspace = true, default-features = true }
+aya = { workspace = true }
+aya-log = { workspace = true }
+env_logger = { workspace = true }
+libc = { workspace = true }
+log = { workspace = true }
+tokio = { workspace = true, features = [
+    "macros",
+    "rt",
+    "rt-multi-thread",
+    "net",
+    "signal",
+] }
+clap = { workspace = true, features = ["derive"] }
+[build-dependencies]
+anyhow = { workspace = true }
+aya-build = { workspace = true }
+firewall-ebpf = { path = "../firewall-ebpf" }
+
+[[bin]]
+name = "firewall"
+path = "src/main.rs"

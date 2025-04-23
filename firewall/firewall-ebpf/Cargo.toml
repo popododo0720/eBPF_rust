@@ -1,0 +1,18 @@
+[package]
+name = "firewall-ebpf"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+firewall-common = { path = "../firewall-common" }
+
+aya-ebpf = { workspace = true }
+aya-log-ebpf = { workspace = true }
+network-types = "0.0.7"
+
+[build-dependencies]
+which = { workspace = true }
+
+[[bin]]
+name = "firewall"
+path = "src/main.rs"

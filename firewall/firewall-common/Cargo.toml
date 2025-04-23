@@ -1,0 +1,17 @@
+[package]
+name = "firewall-common"
+version = "0.1.0"
+edition = "2024"
+
+license.workspace = true
+
+[features]
+default = []
+user = ["aya"]
+
+[dependencies]
+aya = { workspace = true, optional = true }
+zerocopy = "0.8.24"
+
+[lib]
+path = "src/lib.rs"
