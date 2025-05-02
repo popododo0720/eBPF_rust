@@ -5,7 +5,7 @@ use aya_ebpf::{
     bindings::xdp_action, 
     macros::{map, xdp}, 
     programs::XdpContext, 
-    maps::{HashMap, PerCpuArray},
+    maps::HashMap,
 };
 use aya_log_ebpf::info;
 use core::mem;
@@ -16,20 +16,28 @@ use network_types::{
     udp::UdpHdr,
 };
 
-use firewall_common::FirewallStruct;
+use firewall_common::{PacketInfo, PolicyKeyL3, PolicyKeyL4};
 
-#[map] 
-static BLOCKLIST: HashMap<FirewallStruct, u32> =
-    HashMap::<FirewallStruct, u32>::with_max_entries(1024, 0);
+// ID 없는경우 기본 ID
+const WORLD_ID: u32 = 0;
+const EBPF_ACTION_DROP: u32 = 1;
+const EBPF_ACTION_PASS: u32 = 2;
 
+// --- ID 기반 맵  ---
 #[map]
-static DROP_COUNT: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
+static IP_ID_MAP: HashMap<u32, u32> = HashMap::<u32, u32>::with_max_entries(4096, 0);
+// --- L4 ---
+#[map]
+static BLOCK_POLICY_L4_MAP: HashMap<PolicyKeyL4, u32> = HashMap::<PolicyKeyL4, u32>::with_max_entries(8192, 0);
+// --- L3 ---
+#[map]
+static BLOCK_POLICY_L3_MAP: HashMap<PolicyKeyL3, u32> = HashMap::<PolicyKeyL3, u32>::with_max_entries(2048, 0);
 
 #[xdp]
 pub fn ebpf_main(ctx: XdpContext) -> u32 {
     match try_xdp_firewall(ctx) {
         Ok(ret) => ret,
-        Err(_) => xdp_action::XDP_ABORTED,
+        Err(_) => xdp_action::XDP_PASS,
     }
 }
 
@@ -45,95 +53,59 @@ fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
     Ok((start + offset) as *const T)
 }
 
-fn is_blocked(packet_info: FirewallStruct) -> bool {
-    let mut key_to_check = FirewallStruct {
-        src_addr: packet_info.src_addr, 
-        dst_addr: packet_info.dst_addr,
-        src_port: 0,                 
-        dst_port: packet_info.dst_port,                
-        protocol: 0,                   
-        _reserved: [0; 3],
-    };
-
-    // 1. 정확한 IP 주소 조합 확인 (포트/프로토콜 무시)
-    if unsafe { BLOCKLIST.get(&key_to_check).is_some() } {
-        return true;
-    }
-
-    // 2. 목적지 IP 주소만 와일드카드(0)인 규칙 확인 (포트/프로토콜 무시)
-    key_to_check.dst_addr = 0; 
-    if unsafe { BLOCKLIST.get(&key_to_check).is_some() } {
-        return true;
-    }
-
-    // 3. 출발지 IP 주소만 와일드카드(0)인 규칙 확인 (포트/프로토콜 무시)
-    key_to_check.src_addr = 0; 
-    if unsafe { BLOCKLIST.get(&key_to_check).is_some() } {
-        return true;
-    }
-
-    // 위의 어떤 IP 조합 규칙과도 일치하지 않으면 차단하지 않음
-    false
-}
-
 fn try_xdp_firewall(ctx: XdpContext) -> Result<u32, ()> {
-
-    let mut fw_struct = FirewallStruct::default();
-
     // ethernet header
     let ethhdr: *const EthHdr = ptr_at(&ctx, 0)?;
-    match unsafe { (*ethhdr).ether_type } {
-        EtherType::Ipv4 => {}
-        _ => return Ok(xdp_action::XDP_PASS),
+    if unsafe { (*ethhdr).ether_type } != EtherType::Ipv4 {
+        return Ok(xdp_action::XDP_PASS);
     }
 
     let ipv4hdr: *const Ipv4Hdr = ptr_at(&ctx, EthHdr::LEN)?;
+    let src_addr = unsafe { (*ipv4hdr).src_addr };
+    let dst_addr = unsafe { (*ipv4hdr).dst_addr };
+    let protocol_enum = unsafe { (*ipv4hdr).proto };
+    let protocol = protocol_enum as u8;
 
-    fw_struct.src_addr = unsafe { (*ipv4hdr).src_addr };
-
-    fw_struct.dst_addr = unsafe { (*ipv4hdr).dst_addr };
-    fw_struct.protocol = unsafe { (*ipv4hdr).proto } as u8;
-    
-    (fw_struct.src_port, fw_struct.dst_port) = match unsafe { (*ipv4hdr).proto } {
-        IpProto::Tcp => {
-            let tcphdr: *const TcpHdr =
-                ptr_at(&ctx, EthHdr::LEN + Ipv4Hdr::LEN)?;
-            (
-                unsafe { (*tcphdr).source },
-                unsafe { (*tcphdr).dest },
-            )
-        }
-        IpProto::Udp => {
-            let udphdr: *const UdpHdr =
-                ptr_at(&ctx, EthHdr::LEN + Ipv4Hdr::LEN)?;
-            (
-                unsafe { (*udphdr).source },
-                unsafe { (*udphdr).dest },
-            )
-        }
-        _ => return Err(()),
+    let dst_port = match protocol_enum {
+        IpProto::Tcp => unsafe { *ptr_at::<TcpHdr>(&ctx, EthHdr::LEN + Ipv4Hdr::LEN)? }.dest,
+        IpProto::Udp => unsafe { *ptr_at::<UdpHdr>(&ctx, EthHdr::LEN + Ipv4Hdr::LEN)? }.dest,
+        _ => return Ok(xdp_action::XDP_PASS), 
     };
 
-    let action = if is_blocked(fw_struct) {
-        let index: u32 = 0; 
-        let count_ptr = unsafe { DROP_COUNT.get_ptr_mut(index) };
+    let src_id = unsafe { IP_ID_MAP.get(&src_addr).copied().unwrap_or(WORLD_ID) };
+    let dst_id = unsafe { IP_ID_MAP.get(&dst_addr).copied().unwrap_or(WORLD_ID) };
 
-        let mut current_cpu_count: u64 = 0; 
-        if let Some(ptr) = count_ptr {
-            unsafe {
-                *ptr += 1;
-                current_cpu_count = *ptr;
-            }
-        } else {
-            info!(&ctx, "drop (counter error)");
-        }
-
-        xdp_action::XDP_DROP
-    } else {
-        xdp_action::XDP_PASS
+    let policy_key_l4 = PolicyKeyL4 { 
+        src_id, dst_id, dst_port, protocol, _padding: 0 
     };
+    if let Some(action_val_ptr) = unsafe { BLOCK_POLICY_L4_MAP.get(&policy_key_l4) } {
+        let action_val = *action_val_ptr;
+        if action_val == EBPF_ACTION_DROP {
+            info!(&ctx, "Blocked by L4 policy (action={})", action_val);
+            return Ok(xdp_action::XDP_DROP);
+        } else if action_val == EBPF_ACTION_PASS {
+            info!(&ctx, "Passed by L4 policy (action={})", action_val);
+            return Ok(xdp_action::XDP_PASS);
+        }
+        return Ok(xdp_action::XDP_PASS);
+    }
 
-    Ok(action)
+    let policy_key_l3 = PolicyKeyL3 { 
+        src_id, dst_id 
+    };
+    if let Some(action_val_ptr) = unsafe { BLOCK_POLICY_L3_MAP.get(&policy_key_l3) } { // L3 맵 조회 시 값 확인 추가
+        let action_val = *action_val_ptr;
+        if action_val == EBPF_ACTION_DROP {
+            info!(&ctx, "Blocked by L3 policy (action={})", action_val);
+            return Ok(xdp_action::XDP_DROP);
+        } else if action_val == EBPF_ACTION_PASS {
+            info!(&ctx, "Passed by L3 policy (action={})", action_val);
+            return Ok(xdp_action::XDP_PASS);
+        }
+        return Ok(xdp_action::XDP_PASS);
+    }
+
+    Ok(xdp_action::XDP_PASS)
 }
 
 #[cfg(not(test))]
