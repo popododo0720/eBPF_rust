@@ -21,10 +21,14 @@ tokio = { workspace = true, features = [
     "signal",
 ] }
 clap = { workspace = true, features = ["derive"] }
+sqlx = { workspace = true , features = [ "runtime-tokio", "postgres" ] }
+
 [build-dependencies]
 anyhow = { workspace = true }
 aya-build = { workspace = true }
 firewall-ebpf = { path = "../firewall-ebpf" }
+
+
 
 [[bin]]
 name = "firewall"

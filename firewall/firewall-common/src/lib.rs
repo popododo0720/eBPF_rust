@@ -1,10 +1,9 @@
 // firewall-common/src/lib.rs
 #![no_std]
 
-use bytemuck::{Pod, Zeroable};
 
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash, Zeroable, Pod)]
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash)]
 pub struct FirewallStruct {
     pub src_addr: u32,       
     pub dst_addr: u32,      
@@ -14,3 +13,5 @@ pub struct FirewallStruct {
     pub _reserved: [u8; 3],
 }
 
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for FirewallStruct {} // (1)
